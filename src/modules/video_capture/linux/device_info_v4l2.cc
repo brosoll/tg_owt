@@ -24,6 +24,7 @@
 #include <linux/videodev2.h>
 #endif
 
+#include <algorithm>
 #include <vector>
 
 #include "modules/video_capture/video_capture.h"
@@ -265,13 +266,85 @@ int32_t DeviceInfoV4l2::FillCapabilities(int fd) {
                             {960, 720},  {1280, 720}, {1024, 768}, {1440, 1080},
                             {1920, 1080}};
 
+  // Query which pixel formats the device actually offers before probing.
+  // VIDIOC_ENUM_FMT and VIDIOC_ENUM_FRAMESIZES are answered from in-kernel
+  // descriptors without any USB traffic on uvcvideo, while every
+  // VIDIOC_TRY_FMT can trigger a full UVC probe negotiation with the device.
+  // Some webcams have firmware that answers those probe requests slowly
+  // (measured ~33 ms per TRY_FMT on a "Hy-UXGA(B5M2)" camera), so the blind
+  // `totalFmts * sizes` (195 requests) probe matrix below could take ~7
+  // seconds and break callers that have a short camera start timeout. By
+  // enumerating first we can skip every combination that cannot produce a
+  // new capability anyway, and avoid reporting bogus capabilities: for a
+  // pixel format the device does not support the kernel answers TRY_FMT
+  // with the default format at the closest supported size, which the code
+  // below would otherwise store as a capability of the requested (but
+  // unsupported) format.
+  std::vector<unsigned int> offeredFormats;
+  struct v4l2_fmtdesc fmtdesc;
+  memset(&fmtdesc, 0, sizeof(fmtdesc));
+  fmtdesc.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+  while (ioctl(fd, VIDIOC_ENUM_FMT, &fmtdesc) == 0) {
+    offeredFormats.push_back(fmtdesc.pixelformat);
+    fmtdesc.index++;
+  }
+
   for (int fmts = 0; fmts < totalFmts; fmts++) {
+    // If the device did not report any formats (ENUM_FMT unsupported) fall
+    // back to probing all formats as before. Otherwise only probe formats
+    // the device offers.
+    const bool offered =
+        offeredFormats.empty() ||
+        std::find(offeredFormats.begin(), offeredFormats.end(),
+                  videoFormats[fmts]) != offeredFormats.end();
+
+    // For discrete frame sizes only probe the sizes the device reports,
+    // since TRY_FMT answers with the closest supported frame and a size
+    // that is not offered can never be an exact match.
+    bool discreteSizes = false;
+    std::vector<std::pair<unsigned int, unsigned int>> offeredSizes;
+    if (offered && !offeredFormats.empty()) {
+      struct v4l2_frmsizeenum frmsize;
+      memset(&frmsize, 0, sizeof(frmsize));
+      frmsize.pixel_format = videoFormats[fmts];
+      while (ioctl(fd, VIDIOC_ENUM_FRAMESIZES, &frmsize) == 0) {
+        if (frmsize.type == V4L2_FRMSIZE_TYPE_DISCRETE) {
+          offeredSizes.emplace_back(frmsize.discrete.width,
+                                    frmsize.discrete.height);
+          discreteSizes = true;
+        } else {
+          // Stepwise or continuous sizes: any requested size can be
+          // supported, keep probing them all.
+          discreteSizes = false;
+          offeredSizes.clear();
+          break;
+        }
+        frmsize.index++;
+      }
+    }
+
     for (int i = 0; i < sizes; i++) {
+      if (!offered) {
+        continue;
+      }
+      if (discreteSizes &&
+          std::find(offeredSizes.begin(), offeredSizes.end(),
+                    std::make_pair(size[i][0], size[i][1])) ==
+              offeredSizes.end()) {
+        continue;
+      }
       video_fmt.fmt.pix.pixelformat = videoFormats[fmts];
       video_fmt.fmt.pix.width = size[i][0];
       video_fmt.fmt.pix.height = size[i][1];
 
       if (ioctl(fd, VIDIOC_TRY_FMT, &video_fmt) >= 0) {
+        // The kernel overwrites `pixelformat` with the format actually
+        // used, which for an unsupported format is the device's default
+        // format. Skip those answers so we don't report capabilities for
+        // formats the device does not have.
+        if (video_fmt.fmt.pix.pixelformat != videoFormats[fmts]) {
+          continue;
+        }
         if ((video_fmt.fmt.pix.width == size[i][0]) &&
             (video_fmt.fmt.pix.height == size[i][1])) {
           VideoCaptureCapability cap;
